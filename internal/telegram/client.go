@@ -226,5 +226,7 @@ func (c *Client) redact(err error) error {
 	if err == nil {
 		return nil
 	}
-	return errors.New(strings.ReplaceAll(err.Error(), c.token, "[redacted]"))
+	redacted := strings.ReplaceAll(err.Error(), c.token, "[redacted]")
+	redacted = strings.ReplaceAll(redacted, url.PathEscape(c.token), "[redacted]")
+	return errors.New(redacted)
 }

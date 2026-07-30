@@ -192,21 +192,37 @@ func parseGetUpdatesRequest(response http.ResponseWriter, request *http.Request)
 	if err := request.ParseForm(); err != nil {
 		return getUpdatesRequest{}, errors.New("invalid getUpdates form")
 	}
-	return getUpdatesRequest{
-		Offset:  parseInt64(request.Form.Get("offset")),
-		Limit:   parseInt(request.Form.Get("limit")),
-		Timeout: parseInt(request.Form.Get("timeout")),
-	}, nil
+	return parseGetUpdatesForm(request.Form)
 }
 
-func parseInt64(value string) int64 {
-	parsed, _ := strconv.ParseInt(value, 10, 64)
-	return parsed
+func parseGetUpdatesForm(values url.Values) (getUpdatesRequest, error) {
+	offset, err := parseOptionalInt64(values.Get("offset"))
+	if err != nil {
+		return getUpdatesRequest{}, errors.New("invalid getUpdates offset")
+	}
+	limit, err := parseOptionalInt(values.Get("limit"))
+	if err != nil {
+		return getUpdatesRequest{}, errors.New("invalid getUpdates limit")
+	}
+	timeout, err := parseOptionalInt(values.Get("timeout"))
+	if err != nil {
+		return getUpdatesRequest{}, errors.New("invalid getUpdates timeout")
+	}
+	return getUpdatesRequest{Offset: offset, Limit: limit, Timeout: timeout}, nil
 }
 
-func parseInt(value string) int {
-	parsed, _ := strconv.Atoi(value)
-	return parsed
+func parseOptionalInt64(value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(value, 10, 64)
+}
+
+func parseOptionalInt(value string) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(value)
 }
 
 func writeUpdates(response http.ResponseWriter, updates []store.Delivery) {

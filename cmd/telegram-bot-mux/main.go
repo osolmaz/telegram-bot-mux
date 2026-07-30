@@ -110,19 +110,14 @@ func serve(configPath string, logOutput io.Writer) error {
 	router := routing.New(cfg)
 	poller := telegram.NewPoller(telegramClient, updateStore, router.Targets, cfg.Telegram.AllowedUpdates, cfg.Telegram.PollTimeoutSeconds, cfg.Telegram.MaxRetrySeconds, logger)
 	handler := muxserver.New(updateStore, telegramClient, credentials.ClientTokens, logger)
-	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.Listen)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 	defer func() { _ = listener.Close() }()
-	httpServer := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	httpServer := newHTTPServer(ctx, handler)
 	errorsChannel := make(chan error, 2)
 	go func() { errorsChannel <- poller.Run(ctx) }()
 	go func() { errorsChannel <- httpServer.Serve(listener) }()
@@ -141,6 +136,16 @@ func serve(configPath string, logOutput io.Writer) error {
 	return nil
 }
 
+func newHTTPServer(ctx context.Context, handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+}
+
 func loadRuntime(configPath string) (config.Config, config.Credentials, *store.Store, *telegram.Client, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -152,7 +157,7 @@ func loadRuntime(configPath string) (config.Config, config.Credentials, *store.S
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	updateStore, err := store.Open(ctx, cfg.Database, config.ClientIDs(cfg), cfg.Retention.MaxPendingPerClient, cfg.Retention.AcknowledgedSafetyWindow)
+	updateStore, err := store.Open(ctx, cfg.Database, config.ClientIDs(cfg), cfg.Retention.MaxPendingPerClient, cfg.Retention.SafetyWindow())
 	if err != nil {
 		return config.Config{}, config.Credentials{}, nil, nil, err
 	}

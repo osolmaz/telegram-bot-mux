@@ -152,6 +152,9 @@ func TestGetUpdatesRejectsInvalidRequests(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid request status = %d body=%s", response.Code, response.Body.String())
 	}
+	for _, query := range []string{"offset=abc", "limit=abc", "timeout=abc"} {
+		assertStatus(t, handler, http.MethodGet, clientBotPath("openclaw", openclawToken, "getUpdates")+"?"+query, nil, http.StatusBadRequest)
+	}
 	assertStatus(t, handler, http.MethodDelete, clientBotPath("openclaw", openclawToken, "sendMessage"), nil, http.StatusMethodNotAllowed)
 	assertStatus(t, handler, http.MethodPost, "/client/openclaw/bot"+openclawToken+"/bad%20method", nil, http.StatusBadRequest)
 }

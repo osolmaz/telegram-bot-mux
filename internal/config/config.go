@@ -72,8 +72,8 @@ type RoutingRule struct {
 }
 
 type RetentionConfig struct {
-	MaxPendingPerClient      int `json:"max_pending_per_client,omitempty"`
-	AcknowledgedSafetyWindow int `json:"acknowledged_safety_window,omitempty"`
+	MaxPendingPerClient      int  `json:"max_pending_per_client,omitempty"`
+	AcknowledgedSafetyWindow *int `json:"acknowledged_safety_window,omitempty"`
 }
 
 type Credentials struct {
@@ -147,9 +147,17 @@ func applyRetentionDefaults(cfg *RetentionConfig) {
 	if cfg.MaxPendingPerClient == 0 {
 		cfg.MaxPendingPerClient = DefaultMaxPending
 	}
-	if cfg.AcknowledgedSafetyWindow == 0 {
-		cfg.AcknowledgedSafetyWindow = DefaultSafetyWindow
+	if cfg.AcknowledgedSafetyWindow == nil {
+		value := DefaultSafetyWindow
+		cfg.AcknowledgedSafetyWindow = &value
 	}
+}
+
+func (cfg RetentionConfig) SafetyWindow() int {
+	if cfg.AcknowledgedSafetyWindow == nil {
+		return DefaultSafetyWindow
+	}
+	return *cfg.AcknowledgedSafetyWindow
 }
 
 func Validate(cfg Config) error {
@@ -229,7 +237,7 @@ func validateRetention(cfg RetentionConfig) error {
 	if cfg.MaxPendingPerClient < 1 {
 		return errors.New("retention.max_pending_per_client must be positive")
 	}
-	if cfg.AcknowledgedSafetyWindow < 0 {
+	if cfg.SafetyWindow() < 0 {
 		return errors.New("retention.acknowledged_safety_window must not be negative")
 	}
 	return nil
@@ -358,6 +366,9 @@ func LoadCredentials(cfg Config) (Credentials, error) {
 	if err != nil {
 		return Credentials{}, fmt.Errorf("read telegram token: %w", err)
 	}
+	if err := validateTelegramToken(telegramToken); err != nil {
+		return Credentials{}, err
+	}
 	credentials := Credentials{TelegramToken: telegramToken, ClientTokens: make(map[string]string, len(cfg.Clients))}
 	seen := map[string]string{telegramToken: "telegram"}
 	for _, client := range cfg.Clients {
@@ -375,6 +386,13 @@ func LoadCredentials(cfg Config) (Credentials, error) {
 		credentials.ClientTokens[client.ID] = token
 	}
 	return credentials, nil
+}
+
+func validateTelegramToken(token string) error {
+	if len(token) < minimumClientTokenSize || !clientTokenPattern.MatchString(token) {
+		return errors.New("telegram token must look like a Telegram Bot API token with at least 32 secret characters")
+	}
+	return nil
 }
 
 func readSecret(path string) (string, error) {

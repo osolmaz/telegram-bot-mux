@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +118,39 @@ func TestServeLifecycleAndOnlineDoctor(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("serve did not shut down")
+	}
+}
+
+func TestHTTPServerCancellationEndsActiveRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-request.Context().Done()
+	})
+	server := httptest.NewUnstartedServer(handler)
+	server.Config = newHTTPServer(ctx, handler)
+	server.Start()
+	defer server.Close()
+	responseDone := make(chan struct{})
+	go func() {
+		response, _ := server.Client().Get(server.URL)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		close(responseDone)
+	}()
+	<-started
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	if err := server.Config.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-responseDone:
+	case <-time.After(time.Second):
+		t.Fatal("active request did not end after cancellation")
 	}
 }
 

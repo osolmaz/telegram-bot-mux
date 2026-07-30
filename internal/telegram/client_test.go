@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -201,5 +203,10 @@ func TestRedactsNetworkErrors(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), testTelegramToken) {
 		t.Fatal("network error leaked Telegram token")
+	}
+	reserved := "123456:secret/with%reserved"
+	redacted := New(reserved, "http://127.0.0.1:1", "http://127.0.0.1:1", nil).redact(errors.New(url.PathEscape(reserved)))
+	if strings.Contains(redacted.Error(), reserved) || strings.Contains(redacted.Error(), url.PathEscape(reserved)) {
+		t.Fatal("escaped Telegram token was not redacted")
 	}
 }

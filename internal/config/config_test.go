@@ -72,7 +72,7 @@ func TestValidateExclusiveRouting(t *testing.T) {
 		Telegram:  TelegramConfig{TokenFile: "/tmp/telegram", APIBase: DefaultAPIBase, FileBase: DefaultAPIBase, PollTimeoutSeconds: 30, MaxRetrySeconds: 30},
 		Clients:   []ClientConfig{{ID: "openclaw", TokenFile: "/tmp/openclaw"}, {ID: "unyolo", TokenFile: "/tmp/unyolo"}},
 		Routing:   RoutingConfig{Mode: "exclusive", Rules: []RoutingRule{{Clients: []string{"unyolo"}, UpdateTypes: []string{"callback_query"}, CallbackDataPrefixes: []string{"bk:"}}}, FallbackClients: []string{"openclaw"}},
-		Retention: RetentionConfig{MaxPendingPerClient: 10, AcknowledgedSafetyWindow: 1},
+		Retention: RetentionConfig{MaxPendingPerClient: 10, AcknowledgedSafetyWindow: intPointer(1)},
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
@@ -80,6 +80,25 @@ func TestValidateExclusiveRouting(t *testing.T) {
 	cfg.Routing.Rules[0].Clients = []string{"missing"}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "unknown client") {
 		t.Fatalf("Validate error = %v", err)
+	}
+}
+
+func TestLoadPreservesExplicitZeroSafetyWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeTestFile(t, path, `{
+		"version": 1,
+		"database": "`+filepath.Join(dir, "state.db")+`",
+		"telegram": {"token_file": "`+filepath.Join(dir, "telegram.token")+`"},
+		"clients": [{"id": "client", "token_file": "`+filepath.Join(dir, "client.token")+`"}],
+		"retention": {"acknowledged_safety_window": 0}
+	}`, 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Retention.SafetyWindow() != 0 {
+		t.Fatalf("safety window = %d", cfg.Retention.SafetyWindow())
 	}
 }
 
@@ -121,6 +140,10 @@ func TestLoadCredentialsRejectsDuplicatesAndWeakTokens(t *testing.T) {
 	if _, err := LoadCredentials(cfg); err == nil || !strings.Contains(err.Error(), "must look like") {
 		t.Fatalf("weak error = %v", err)
 	}
+	writeTestFile(t, telegramPath, "invalid/telegram%token", 0o600)
+	if _, err := LoadCredentials(cfg); err == nil || !strings.Contains(err.Error(), "telegram token must look like") {
+		t.Fatalf("physical token error = %v", err)
+	}
 }
 
 func TestValidateBoundaryCases(t *testing.T) {
@@ -150,7 +173,7 @@ func TestValidateBoundaryCases(t *testing.T) {
 		{"unknown routing mode", func(c *Config) { c.Routing.Mode = "magic" }, "broadcast or exclusive"},
 		{"broadcast fields", func(c *Config) { c.Routing.Rules = []RoutingRule{{}} }, "must not define"},
 		{"bad retention", func(c *Config) { c.Retention.MaxPendingPerClient = -1 }, "must be positive"},
-		{"bad safety window", func(c *Config) { c.Retention.AcknowledgedSafetyWindow = -1 }, "must not be negative"},
+		{"bad safety window", func(c *Config) { c.Retention.AcknowledgedSafetyWindow = intPointer(-1) }, "must not be negative"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -171,7 +194,7 @@ func TestValidateBoundaryCases(t *testing.T) {
 func TestSecretFileShapeErrors(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Telegram: TelegramConfig{TokenFile: filepath.Join(dir, "telegram")}, Clients: []ClientConfig{{ID: "client", TokenFile: filepath.Join(dir, "client")}}}
-	writeTestFile(t, cfg.Telegram.TokenFile, "telegram", 0o600)
+	writeTestFile(t, cfg.Telegram.TokenFile, "123456:telegram_token_value_abcdefghijklmnopqrstuvwxyz", 0o600)
 	if err := os.Mkdir(cfg.Clients[0].TokenFile, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +213,8 @@ func TestSecretFileShapeErrors(t *testing.T) {
 		t.Fatalf("oversize error = %v", err)
 	}
 }
+
+func intPointer(value int) *int { return &value }
 
 func writeTestFile(t *testing.T, path, value string, mode os.FileMode) {
 	t.Helper()
