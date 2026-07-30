@@ -74,13 +74,14 @@ func (c *Client) GetMe(ctx context.Context) error {
 }
 
 func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds int, allowedUpdates []string) ([]routing.Update, error) {
-	payload := map[string]any{
-		"offset":  offset,
-		"limit":   100,
-		"timeout": timeoutSeconds,
+	if allowedUpdates == nil {
+		allowedUpdates = []string{}
 	}
-	if len(allowedUpdates) > 0 {
-		payload["allowed_updates"] = allowedUpdates
+	payload := map[string]any{
+		"offset":          offset,
+		"limit":           100,
+		"timeout":         timeoutSeconds,
+		"allowed_updates": allowedUpdates,
 	}
 	var raw []json.RawMessage
 	if err := c.call(ctx, "getUpdates", payload, &raw, time.Duration(timeoutSeconds+10)*time.Second); err != nil {

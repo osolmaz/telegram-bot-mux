@@ -58,6 +58,26 @@ func TestClientLifecycleAndUpdates(t *testing.T) {
 	}
 }
 
+func TestGetUpdatesResetsTelegramSubscriptionFilter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var payload struct {
+			AllowedUpdates []string `json:"allowed_updates"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.AllowedUpdates == nil || len(payload.AllowedUpdates) != 0 {
+			t.Fatalf("allowed_updates = %#v, want explicit empty list", payload.AllowedUpdates)
+		}
+		_, _ = io.WriteString(response, `{"ok":true,"result":[]}`)
+	}))
+	defer server.Close()
+	client := New(testTelegramToken, server.URL, server.URL, server.Client())
+	if _, err := client.GetUpdates(context.Background(), 0, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientRejectsTelegramErrorsAndInvalidResults(t *testing.T) {
 	tests := []struct {
 		name string
