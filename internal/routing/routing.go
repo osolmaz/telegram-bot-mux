@@ -39,27 +39,55 @@ func New(cfg config.Config) *Router {
 }
 
 func ParseUpdate(raw json.RawMessage) (Update, error) {
+	object, err := decodeUpdateObject(raw)
+	if err != nil {
+		return Update{}, err
+	}
+	id, err := parseUpdateID(object)
+	if err != nil {
+		return Update{}, err
+	}
+	updateType, payload, err := updatePayload(object)
+	if err != nil {
+		return Update{}, err
+	}
+	callbackData, err := parseCallbackData(updateType, payload)
+	if err != nil {
+		return Update{}, err
+	}
+	return Update{ID: id, Type: updateType, CallbackData: callbackData, Raw: slices.Clone(raw)}, nil
+}
+
+func decodeUpdateObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var object map[string]json.RawMessage
 	if err := decoder.Decode(&object); err != nil {
-		return Update{}, fmt.Errorf("decode update: %w", err)
+		return nil, fmt.Errorf("decode update: %w", err)
 	}
 	if len(object) < 2 {
-		return Update{}, errors.New("update must contain update_id and one update payload")
+		return nil, errors.New("update must contain update_id and one update payload")
 	}
+	return object, nil
+}
+
+func parseUpdateID(object map[string]json.RawMessage) (int64, error) {
 	idRaw, exists := object["update_id"]
 	if !exists {
-		return Update{}, errors.New("update_id is required")
+		return 0, errors.New("update_id is required")
 	}
 	var id json.Number
 	if err := json.Unmarshal(idRaw, &id); err != nil {
-		return Update{}, errors.New("update_id must be an integer")
+		return 0, errors.New("update_id must be an integer")
 	}
-	parsedID, err := id.Int64()
-	if err != nil || parsedID < 0 {
-		return Update{}, errors.New("update_id must be a nonnegative integer")
+	parsed, err := id.Int64()
+	if err != nil || parsed < 0 {
+		return 0, errors.New("update_id must be a nonnegative integer")
 	}
+	return parsed, nil
+}
+
+func updatePayload(object map[string]json.RawMessage) (string, json.RawMessage, error) {
 	keys := make([]string, 0, len(object)-1)
 	for key := range object {
 		if key != "update_id" {
@@ -67,20 +95,22 @@ func ParseUpdate(raw json.RawMessage) (Update, error) {
 		}
 	}
 	if len(keys) != 1 {
-		return Update{}, errors.New("update must contain exactly one update payload")
+		return "", nil, errors.New("update must contain exactly one update payload")
 	}
-	updateType := keys[0]
-	callbackData := ""
-	if updateType == "callback_query" {
-		var callback struct {
-			Data string `json:"data"`
-		}
-		if err := json.Unmarshal(object[updateType], &callback); err != nil {
-			return Update{}, fmt.Errorf("decode callback_query: %w", err)
-		}
-		callbackData = callback.Data
+	return keys[0], object[keys[0]], nil
+}
+
+func parseCallbackData(updateType string, payload json.RawMessage) (string, error) {
+	if updateType != "callback_query" {
+		return "", nil
 	}
-	return Update{ID: parsedID, Type: updateType, CallbackData: callbackData, Raw: slices.Clone(raw)}, nil
+	var callback struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &callback); err != nil {
+		return "", fmt.Errorf("decode callback_query: %w", err)
+	}
+	return callback.Data, nil
 }
 
 func (r *Router) Targets(update Update) []string {

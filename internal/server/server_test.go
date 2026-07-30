@@ -156,6 +156,56 @@ func TestGetUpdatesRejectsInvalidRequests(t *testing.T) {
 	assertStatus(t, handler, http.MethodPost, "/client/openclaw/bot"+openclawToken+"/bad%20method", nil, http.StatusBadRequest)
 }
 
+func TestLongPollTimeoutCancellationAndProxyFailures(t *testing.T) {
+	handler, updateStore, upstream := newTestServer(t)
+	defer updateStore.Close()
+	request := httptest.NewRequest(http.MethodGet, clientBotPath("openclaw", openclawToken, "getUpdates")+"?timeout=1", nil)
+	response := httptest.NewRecorder()
+	started := time.Now()
+	handler.ServeHTTP(response, request)
+	if time.Since(started) < 900*time.Millisecond || !strings.Contains(response.Body.String(), `"result":[]`) {
+		t.Fatalf("timeout response after %s: %s", time.Since(started), response.Body.String())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelRequest := httptest.NewRequest(http.MethodGet, clientBotPath("openclaw", openclawToken, "getUpdates")+"?timeout=50", nil).WithContext(ctx)
+	cancelResponse := httptest.NewRecorder()
+	handler.ServeHTTP(cancelResponse, cancelRequest)
+	if cancelResponse.Body.Len() != 0 {
+		t.Fatalf("canceled response = %q", cancelResponse.Body.String())
+	}
+
+	upstream.Close()
+	assertStatus(t, handler, http.MethodPost, clientBotPath("openclaw", openclawToken, "sendMessage"), strings.NewReader("x"), http.StatusBadGateway)
+	assertStatus(t, handler, http.MethodGet, "/client/openclaw/file/bot"+openclawToken+"/file.txt", nil, http.StatusBadGateway)
+	assertStatus(t, handler, http.MethodPost, "/client/openclaw/file/bot"+openclawToken+"/file.txt", nil, http.StatusMethodNotAllowed)
+	assertStatus(t, handler, http.MethodGet, "/unknown", nil, http.StatusNotFound)
+}
+
+func TestWebhookInfoStoreFailureAndClientAPIBase(t *testing.T) {
+	handler, updateStore, upstream := newTestServer(t)
+	upstream.Close()
+	updateStore.Close()
+	assertStatus(t, handler, http.MethodPost, clientBotPath("openclaw", openclawToken, "getWebhookInfo"), nil, http.StatusInternalServerError)
+	if got := ClientAPIBase(":8080", "openclaw"); got != "http://127.0.0.1:8080/client/openclaw" {
+		t.Fatalf("ClientAPIBase = %q", got)
+	}
+	if got := ClientAPIBase("localhost:9000", "unyolo"); got != "http://localhost:9000/client/unyolo" {
+		t.Fatalf("ClientAPIBase = %q", got)
+	}
+}
+
+func TestFileHeadAndMalformedPaths(t *testing.T) {
+	handler, updateStore, upstream := newTestServer(t)
+	defer updateStore.Close()
+	defer upstream.Close()
+	assertStatus(t, handler, http.MethodHead, "/client/openclaw/file/bot"+openclawToken+"/file.txt", nil, http.StatusOK)
+	for _, path := range []string{"/client", "/client/openclaw", "/client/openclaw/file", "/client/openclaw/nope/token/value"} {
+		assertStatus(t, handler, http.MethodGet, path, nil, http.StatusNotFound)
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, *store.Store, *httptest.Server) {
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {

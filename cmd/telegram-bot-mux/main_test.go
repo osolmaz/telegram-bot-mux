@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestRunVersionAndUnknownCommand(t *testing.T) {
@@ -75,6 +80,46 @@ func TestGenerateClientTokenAndDoctorBackup(t *testing.T) {
 	}
 }
 
+func TestServeLifecycleAndOnlineDoctor(t *testing.T) {
+	telegram := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/getMe"):
+			io.WriteString(response, `{"ok":true,"result":{"id":123}}`)
+		case strings.HasSuffix(request.URL.Path, "/getUpdates"):
+			time.Sleep(20 * time.Millisecond)
+			io.WriteString(response, `{"ok":true,"result":[]}`)
+		default:
+			io.WriteString(response, `{"ok":true,"result":true}`)
+		}
+	}))
+	defer telegram.Close()
+	dir := t.TempDir()
+	configPath := writeRuntimeConfig(t, dir, telegram.URL)
+	var output bytes.Buffer
+	if err := run([]string{"doctor", "--config", configPath}, &output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "telegram: ok") {
+		t.Fatalf("doctor output = %q", output.String())
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- serve(configPath, &output) }()
+	time.Sleep(100 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not shut down")
+	}
+}
+
 func TestCommandsRequireArguments(t *testing.T) {
 	var output bytes.Buffer
 	for _, args := range [][]string{{"serve"}, {"doctor"}, {"backup"}, {"generate-client-token"}} {
@@ -82,4 +127,34 @@ func TestCommandsRequireArguments(t *testing.T) {
 			t.Fatalf("run(%v) succeeded", args)
 		}
 	}
+	if err := generateClientToken("relative", &output); err == nil {
+		t.Fatal("relative token path succeeded")
+	}
+	if err := backup("relative", "/tmp/backup"); err == nil {
+		t.Fatal("relative config path succeeded")
+	}
+}
+
+func writeRuntimeConfig(t *testing.T, dir, apiBase string) string {
+	t.Helper()
+	telegramTokenPath := filepath.Join(dir, "telegram.token")
+	clientTokenPath := filepath.Join(dir, "client.token")
+	if err := os.WriteFile(telegramTokenPath, []byte("123456:telegram_token_value_abcdefghijklmnopqrstuvwxyz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientTokenPath, []byte("654321:client_token_value_abcdefghijklmnopqrstuvwxyz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "runtime.json")
+	content := `{
+		"version":1,
+		"listen":"127.0.0.1:0",
+		"database":"` + filepath.Join(dir, "runtime.db") + `",
+		"telegram":{"token_file":"` + telegramTokenPath + `","api_base":"` + apiBase + `","file_base":"` + apiBase + `"},
+		"clients":[{"id":"client","token_file":"` + clientTokenPath + `"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
 }

@@ -40,51 +40,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	switch args[0] {
 	case "serve":
-		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		configPath := flags.String("config", "", "absolute path to config.json")
-		if err := flags.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *configPath == "" {
-			return errors.New("serve requires --config")
-		}
-		return serve(*configPath, stderr)
+		return runPathCommand("serve", args[1:], "config", "absolute path to config.json", stderr, func(path string) error {
+			return serve(path, stderr)
+		})
 	case "doctor":
-		flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		configPath := flags.String("config", "", "absolute path to config.json")
-		offline := flags.Bool("offline", false, "skip Telegram getMe")
-		if err := flags.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *configPath == "" {
-			return errors.New("doctor requires --config")
-		}
-		return doctor(*configPath, *offline, stdout)
+		return runDoctorCommand(args[1:], stdout, stderr)
 	case "backup":
-		flags := flag.NewFlagSet("backup", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		configPath := flags.String("config", "", "absolute path to config.json")
-		outputPath := flags.String("out", "", "absolute output database path")
-		if err := flags.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *configPath == "" || *outputPath == "" {
-			return errors.New("backup requires --config and --out")
-		}
-		return backup(*configPath, *outputPath)
+		return runBackupCommand(args[1:], stderr)
 	case "generate-client-token":
-		flags := flag.NewFlagSet("generate-client-token", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		outputPath := flags.String("out", "", "absolute output secret path")
-		if err := flags.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *outputPath == "" {
-			return errors.New("generate-client-token requires --out")
-		}
-		return generateClientToken(*outputPath, stdout)
+		return runPathCommand("generate-client-token", args[1:], "out", "absolute output secret path", stderr, func(path string) error {
+			return generateClientToken(path, stdout)
+		})
 	case "version":
 		_, err := fmt.Fprintln(stdout, version)
 		return err
@@ -93,21 +59,62 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
+func runDoctorCommand(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "absolute path to config.json")
+	offline := flags.Bool("offline", false, "skip Telegram getMe")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configPath == "" {
+		return errors.New("doctor requires --config")
+	}
+	return doctor(*configPath, *offline, stdout)
+}
+
+func runBackupCommand(args []string, stderr io.Writer) error {
+	flags := flag.NewFlagSet("backup", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "absolute path to config.json")
+	outputPath := flags.String("out", "", "absolute output database path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configPath == "" || *outputPath == "" {
+		return errors.New("backup requires --config and --out")
+	}
+	return backup(*configPath, *outputPath)
+}
+
+func runPathCommand(command string, args []string, name, description string, stderr io.Writer, action func(string) error) error {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	value := flags.String(name, "", description)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *value == "" {
+		return fmt.Errorf("%s requires --%s", command, name)
+	}
+	return action(*value)
+}
+
 func serve(configPath string, logOutput io.Writer) error {
 	cfg, credentials, updateStore, telegramClient, err := loadRuntime(configPath)
 	if err != nil {
 		return err
 	}
-	defer updateStore.Close()
+	defer func() { _ = updateStore.Close() }()
 	logger := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	router := routing.New(cfg)
 	poller := telegram.NewPoller(telegramClient, updateStore, router.Targets, cfg.Telegram.AllowedUpdates, cfg.Telegram.PollTimeoutSeconds, cfg.Telegram.MaxRetrySeconds, logger)
 	handler := muxserver.New(updateStore, telegramClient, credentials.ClientTokens, logger)
-	listener, err := net.Listen("tcp", cfg.Listen)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	httpServer := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -158,7 +165,7 @@ func doctor(configPath string, offline bool, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer updateStore.Close()
+	defer func() { _ = updateStore.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := updateStore.IntegrityCheck(ctx); err != nil {
@@ -178,7 +185,7 @@ func backup(configPath, outputPath string) error {
 	if err != nil {
 		return err
 	}
-	defer updateStore.Close()
+	defer func() { _ = updateStore.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := updateStore.IntegrityCheck(ctx); err != nil {
@@ -194,33 +201,47 @@ func generateClientToken(outputPath string, output io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o700); err != nil {
 		return fmt.Errorf("create token directory: %w", err)
 	}
+	token, err := newClientToken()
+	if err != nil {
+		return err
+	}
+	if err := writeClientToken(outputPath, token); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(output, outputPath)
+	return err
+}
+
+func newClientToken() (string, error) {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	prefixBytes := make([]byte, 4)
+	if _, err := rand.Read(prefixBytes); err != nil {
+		return "", fmt.Errorf("generate token prefix: %w", err)
+	}
+	prefix := 100_000 + binary.BigEndian.Uint32(prefixBytes)%900_000
+	return fmt.Sprintf("%d:%s", prefix, base64.RawURLEncoding.EncodeToString(secret)), nil
+}
+
+func writeClientToken(outputPath, token string) error {
 	file, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create token file: %w", err)
 	}
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		file.Close()
-		os.Remove(outputPath)
-		return fmt.Errorf("generate token: %w", err)
-	}
-	prefixBytes := make([]byte, 4)
-	if _, err := rand.Read(prefixBytes); err != nil {
-		file.Close()
-		os.Remove(outputPath)
-		return fmt.Errorf("generate token prefix: %w", err)
-	}
-	prefix := 100_000 + binary.BigEndian.Uint32(prefixBytes)%900_000
-	token := fmt.Sprintf("%d:%s", prefix, base64.RawURLEncoding.EncodeToString(secret))
 	if _, err := fmt.Fprintln(file, token); err != nil {
-		file.Close()
-		os.Remove(outputPath)
+		cleanupGeneratedFile(file, outputPath)
 		return fmt.Errorf("write token file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(outputPath)
+		_ = os.Remove(outputPath)
 		return fmt.Errorf("close token file: %w", err)
 	}
-	_, err = fmt.Fprintln(output, outputPath)
-	return err
+	return nil
+}
+
+func cleanupGeneratedFile(file *os.File, path string) {
+	_ = file.Close()
+	_ = os.Remove(path)
 }

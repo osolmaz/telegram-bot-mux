@@ -55,6 +55,9 @@ func Open(ctx context.Context, path string, clientIDs []string, maxPending, safe
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
+	if err := prepareDatabaseFile(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -68,10 +71,34 @@ func Open(ctx context.Context, path string, clientIDs []string, maxPending, safe
 		notify:       make(chan struct{}),
 	}
 	if err := store.initialize(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func prepareDatabaseFile(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return errors.New("database path must be a regular file")
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("protect database: %w", err)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect database path: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- explicit trusted configuration path.
+	if err != nil {
+		return fmt.Errorf("create database: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close new database: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) initialize(ctx context.Context) error {
@@ -98,28 +125,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("begin migration: %w", err)
 	}
-	defer tx.Rollback()
-	var current int
-	value, err := metaValue(ctx, tx, "schema_version")
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read schema version: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	current, err := storedSchemaVersion(ctx, tx)
+	if err != nil {
+		return err
 	}
-	if value != "" {
-		current, err = strconv.Atoi(value)
-		if err != nil {
-			return errors.New("stored schema version is invalid")
-		}
-	}
-	if current > schemaVersion {
-		return fmt.Errorf("database schema %d is newer than supported schema %d", current, schemaVersion)
-	}
-	if current < 1 {
-		if err := migrationOne(ctx, tx); err != nil {
-			return err
-		}
-		if err := setMeta(ctx, tx, "schema_version", strconv.Itoa(schemaVersion)); err != nil {
-			return err
-		}
+	if err := migrateSchema(ctx, tx, current); err != nil {
+		return err
 	}
 	if err := reconcileClients(ctx, tx, s.clientIDs); err != nil {
 		return err
@@ -128,6 +140,34 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("commit migration: %w", err)
 	}
 	return nil
+}
+
+func storedSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
+	value, err := metaValue(ctx, tx, "schema_version")
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	current, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, errors.New("stored schema version is invalid")
+	}
+	return current, nil
+}
+
+func migrateSchema(ctx context.Context, tx *sql.Tx, current int) error {
+	if current > schemaVersion {
+		return fmt.Errorf("database schema %d is newer than supported schema %d", current, schemaVersion)
+	}
+	if current == schemaVersion {
+		return nil
+	}
+	if err := migrationOne(ctx, tx); err != nil {
+		return err
+	}
+	return setMeta(ctx, tx, "schema_version", strconv.Itoa(schemaVersion))
 }
 
 func migrationOne(ctx context.Context, tx *sql.Tx) error {
@@ -166,28 +206,43 @@ func reconcileClients(ctx context.Context, tx *sql.Tx, clientIDs []string) error
 			return fmt.Errorf("register client %q: %w", id, err)
 		}
 	}
+	stored, err := storedClientIDs(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, id := range stored {
+		if _, exists := configured[id]; !exists {
+			if err := deleteClient(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func storedClientIDs(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT client_id FROM clients`)
 	if err != nil {
-		return fmt.Errorf("list stored clients: %w", err)
+		return nil, fmt.Errorf("list stored clients: %w", err)
 	}
-	var stale []string
+	defer func() { _ = rows.Close() }()
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan stored client: %w", err)
+			return nil, fmt.Errorf("scan stored client: %w", err)
 		}
-		if _, exists := configured[id]; !exists {
-			stale = append(stale, id)
-		}
+		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close stored clients: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stored clients: %w", err)
 	}
-	for _, id := range stale {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM clients WHERE client_id = ?`, id); err != nil {
-			return fmt.Errorf("remove stale client %q: %w", id, err)
-		}
+	return ids, nil
+}
+
+func deleteClient(ctx context.Context, tx *sql.Tx, id string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM clients WHERE client_id = ?`, id); err != nil {
+		return fmt.Errorf("remove stale client %q: %w", id, err)
 	}
 	return nil
 }
@@ -234,7 +289,18 @@ func (s *Store) Ingest(ctx context.Context, updates []routing.Update, targets fu
 	if err != nil {
 		return fmt.Errorf("begin update ingest: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
+	if err := s.ingestTransaction(ctx, tx, updates, targets); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update ingest: %w", err)
+	}
+	s.signal()
+	return nil
+}
+
+func (s *Store) ingestTransaction(ctx context.Context, tx *sql.Tx, updates []routing.Update, targets func(routing.Update) []string) error {
 	maxOffset, err := ingestUpdates(ctx, tx, updates, targets)
 	if err != nil {
 		return err
@@ -246,45 +312,60 @@ func (s *Store) Ingest(ctx context.Context, updates []routing.Update, targets fu
 	if err != nil {
 		return err
 	}
-	if maxOffset > currentOffset {
-		if err := setMeta(ctx, tx, "upstream_offset", strconv.FormatInt(maxOffset, 10)); err != nil {
-			return err
-		}
+	if maxOffset <= currentOffset {
+		return nil
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit update ingest: %w", err)
-	}
-	s.signal()
-	return nil
+	return setMeta(ctx, tx, "upstream_offset", strconv.FormatInt(maxOffset, 10))
 }
 
 func ingestUpdates(ctx context.Context, tx *sql.Tx, updates []routing.Update, targets func(routing.Update) []string) (int64, error) {
 	var maxOffset int64
 	for _, update := range updates {
-		result, err := tx.ExecContext(ctx, `INSERT INTO updates(update_id, update_type, payload, created_at)
-			VALUES (?, ?, ?, ?) ON CONFLICT(update_id) DO NOTHING`, update.ID, update.Type, []byte(update.Raw), time.Now().UTC().Format(time.RFC3339Nano))
+		inserted, err := insertUpdate(ctx, tx, update)
 		if err != nil {
-			return 0, fmt.Errorf("store update %d: %w", update.ID, err)
+			return 0, err
 		}
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("inspect update %d insert: %w", update.ID, err)
-		}
-		if inserted > 0 {
-			for _, clientID := range targets(update) {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(client_id, update_id) VALUES (?, ?)`, clientID, update.ID); err != nil {
-					return 0, fmt.Errorf("route update %d to client %q: %w", update.ID, clientID, err)
-				}
+		if inserted {
+			if err := insertDeliveries(ctx, tx, update.ID, targets(update)); err != nil {
+				return 0, err
 			}
 		}
-		if update.ID == int64(^uint64(0)>>1) {
-			return 0, errors.New("update_id cannot be incremented")
+		nextOffset, err := incrementUpdateID(update.ID)
+		if err != nil {
+			return 0, err
 		}
-		if update.ID+1 > maxOffset {
-			maxOffset = update.ID + 1
-		}
+		maxOffset = max(maxOffset, nextOffset)
 	}
 	return maxOffset, nil
+}
+
+func insertUpdate(ctx context.Context, tx *sql.Tx, update routing.Update) (bool, error) {
+	result, err := tx.ExecContext(ctx, `INSERT INTO updates(update_id, update_type, payload, created_at)
+		VALUES (?, ?, ?, ?) ON CONFLICT(update_id) DO NOTHING`, update.ID, update.Type, []byte(update.Raw), time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return false, fmt.Errorf("store update %d: %w", update.ID, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect update %d insert: %w", update.ID, err)
+	}
+	return inserted > 0, nil
+}
+
+func insertDeliveries(ctx context.Context, tx *sql.Tx, updateID int64, clientIDs []string) error {
+	for _, clientID := range clientIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(client_id, update_id) VALUES (?, ?)`, clientID, updateID); err != nil {
+			return fmt.Errorf("route update %d to client %q: %w", updateID, clientID, err)
+		}
+	}
+	return nil
+}
+
+func incrementUpdateID(updateID int64) (int64, error) {
+	if updateID == int64(^uint64(0)>>1) {
+		return 0, errors.New("update_id cannot be incremented")
+	}
+	return updateID + 1, nil
 }
 
 func enforceBacklogLimit(ctx context.Context, tx *sql.Tx, clientIDs []string, limit int) error {
@@ -316,24 +397,47 @@ func transactionOffset(ctx context.Context, tx *sql.Tx) (int64, error) {
 }
 
 func (s *Store) GetUpdates(ctx context.Context, clientID string, offset int64, limit int) ([]Delivery, error) {
-	if limit < 1 || limit > 100 {
-		limit = 100
-	}
 	if !slices.Contains(s.clientIDs, clientID) {
 		return nil, fmt.Errorf("unknown client %q", clientID)
 	}
+	offset, err := s.prepareOffset(ctx, clientID, offset)
+	if err != nil {
+		return nil, err
+	}
+	updates, err := s.queryUpdates(ctx, clientID, offset, normalizeLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.recordClientActivity(ctx, clientID); err != nil {
+		return nil, err
+	}
+	return updates, nil
+}
+
+func normalizeLimit(limit int) int {
+	if limit < 1 || limit > 100 {
+		return 100
+	}
+	return limit
+}
+
+func (s *Store) prepareOffset(ctx context.Context, clientID string, offset int64) (int64, error) {
 	if offset < 0 {
-		var err error
-		offset, err = s.negativeOffset(ctx, clientID, -offset)
+		resolved, err := s.negativeOffset(ctx, clientID, -offset)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
+		offset = resolved
 	}
 	if offset > 0 {
 		if err := s.acknowledge(ctx, clientID, offset); err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
+	return offset, nil
+}
+
+func (s *Store) queryUpdates(ctx context.Context, clientID string, offset int64, limit int) ([]Delivery, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT u.update_id, u.payload
 		FROM deliveries d JOIN updates u ON u.update_id = d.update_id
 		WHERE d.client_id = ? AND (? = 0 OR d.update_id >= ?)
@@ -341,7 +445,7 @@ func (s *Store) GetUpdates(ctx context.Context, clientID string, offset int64, l
 	if err != nil {
 		return nil, fmt.Errorf("query client updates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	updates := make([]Delivery, 0, limit)
 	for rows.Next() {
 		var delivery Delivery
@@ -355,11 +459,15 @@ func (s *Store) GetUpdates(ctx context.Context, clientID string, offset int64, l
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate client updates: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE clients SET last_seen_at = ? WHERE client_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), clientID)
-	if err != nil {
-		return nil, fmt.Errorf("record client activity: %w", err)
-	}
 	return updates, nil
+}
+
+func (s *Store) recordClientActivity(ctx context.Context, clientID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE clients SET last_seen_at = ? WHERE client_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), clientID)
+	if err != nil {
+		return fmt.Errorf("record client activity: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) negativeOffset(ctx context.Context, clientID string, count int64) (int64, error) {
@@ -384,7 +492,7 @@ func (s *Store) acknowledge(ctx context.Context, clientID string, offset int64) 
 	if err != nil {
 		return fmt.Errorf("begin acknowledgment: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM deliveries WHERE client_id = ? AND update_id < ?`, clientID, offset); err != nil {
 		return fmt.Errorf("acknowledge client updates: %w", err)
 	}
@@ -392,7 +500,7 @@ func (s *Store) acknowledge(ctx context.Context, clientID string, offset int64) 
 		return fmt.Errorf("record client offset: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM updates
-		WHERE update_id < COALESCE((SELECT MAX(update_id) FROM updates), 0) - ?
+		WHERE update_id <= COALESCE((SELECT MAX(update_id) FROM updates), 0) - ?
 		AND NOT EXISTS (SELECT 1 FROM deliveries WHERE deliveries.update_id = updates.update_id)`, s.safetyWindow); err != nil {
 		return fmt.Errorf("prune acknowledged updates: %w", err)
 	}
@@ -428,7 +536,7 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("run integrity check: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,8 +169,87 @@ func TestPrunesAcknowledgedUpdatesOutsideSafetyWindow(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	if !reflect.DeepEqual(ids, []int64{2, 3}) {
+	if !reflect.DeepEqual(ids, []int64{3}) {
 		t.Fatalf("retained update ids = %v", ids)
+	}
+}
+
+func TestDatabaseFileIsProtectedAndMustBeRegular(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := openTestStore(t, path, []string{"client"}, 10, 0)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("database permissions = %o", info.Mode().Perm())
+	}
+	if _, err := Open(ctx, dir, []string{"client"}, 10, 0); err == nil {
+		t.Fatal("directory database path succeeded")
+	}
+}
+
+func TestStoreValidationAndCorruptMetadata(t *testing.T) {
+	if _, err := Open(context.Background(), "relative.db", []string{"client"}, 1, 0); err == nil {
+		t.Fatal("relative database path succeeded")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	store := openTestStore(t, path, []string{"client"}, 10, 0)
+	if _, err := store.db.Exec(`INSERT INTO schema_meta(key,value) VALUES('upstream_offset','invalid')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpstreamOffset(context.Background()); err == nil {
+		t.Fatal("invalid offset was accepted")
+	}
+	if _, err := store.db.Exec(`UPDATE schema_meta SET value='99' WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if _, err := Open(context.Background(), path, []string{"client"}, 10, 0); err == nil {
+		t.Fatal("newer schema was accepted")
+	}
+}
+
+func TestClosedStoreMethodsReturnErrors(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, filepath.Join(t.TempDir(), "state.db"), []string{"client"}, 10, 0)
+	store.Close()
+	if _, err := store.UpstreamOffset(ctx); err == nil {
+		t.Fatal("UpstreamOffset succeeded after close")
+	}
+	if err := store.Ingest(ctx, []routing.Update{testUpdate(t, 1, "message")}, func(routing.Update) []string { return []string{"client"} }); err == nil {
+		t.Fatal("Ingest succeeded after close")
+	}
+	if _, err := store.GetUpdates(ctx, "client", 0, 1); err == nil {
+		t.Fatal("GetUpdates succeeded after close")
+	}
+	if _, err := store.PendingCount(ctx, "client"); err == nil {
+		t.Fatal("PendingCount succeeded after close")
+	}
+	if err := store.IntegrityCheck(ctx); err == nil {
+		t.Fatal("IntegrityCheck succeeded after close")
+	}
+	if err := store.Backup(ctx, filepath.Join(t.TempDir(), "backup.db")); err == nil {
+		t.Fatal("Backup succeeded after close")
+	}
+	if err := store.Backup(ctx, "relative.db"); err == nil {
+		t.Fatal("relative backup succeeded")
+	}
+}
+
+func TestBacklogErrorDetails(t *testing.T) {
+	err := &BacklogError{ClientID: "client", Count: 2, Limit: 1}
+	if !strings.Contains(err.Error(), "client") || !errors.Is(err, ErrBacklogFull) {
+		t.Fatalf("backlog error = %v", err)
 	}
 }
 

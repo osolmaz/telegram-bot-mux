@@ -37,51 +37,81 @@ func NewPoller(client *Client, updateStore UpdateStore, targets func(routing.Upd
 	}
 }
 
+type pollState struct {
+	offset int64
+	delay  time.Duration
+}
+
 func (p *Poller) Run(ctx context.Context) error {
-	if err := p.client.DeleteWebhook(ctx); err != nil {
-		return err
-	}
-	offset, err := p.store.UpstreamOffset(ctx)
+	state, err := p.initialize(ctx)
 	if err != nil {
 		return err
 	}
-	p.logger.Info("Telegram polling started", "offset", offset)
-	delay := time.Second
 	for ctx.Err() == nil {
-		updates, pollErr := p.client.GetUpdates(ctx, offset, p.timeoutSeconds, p.allowedUpdates)
-		if pollErr != nil {
-			if fatalTelegramError(pollErr) {
-				return pollErr
-			}
-			p.logger.Warn("Telegram polling failed; retrying", "error", pollErr, "delay", delay)
-			if !sleepContext(ctx, retryDelay(pollErr, delay, p.maxRetry)) {
-				break
-			}
-			delay = min(delay*2, p.maxRetry)
-			continue
+		if err := p.step(ctx, state); err != nil {
+			return err
 		}
-		if err := p.store.Ingest(ctx, updates, p.targets); err != nil {
-			if !errors.Is(err, store.ErrBacklogFull) {
-				return err
-			}
-			p.logger.Warn("downstream backlog is full; upstream polling paused", "error", err, "delay", delay)
-			if !sleepContext(ctx, delay) {
-				break
-			}
-			delay = min(delay*2, p.maxRetry)
-			continue
-		}
-		for _, update := range updates {
-			if update.ID+1 > offset {
-				offset = update.ID + 1
-			}
-		}
-		if len(updates) > 0 {
-			p.logger.Debug("stored Telegram updates", "count", len(updates), "next_offset", offset)
-		}
-		delay = time.Second
 	}
 	return ctx.Err()
+}
+
+func (p *Poller) initialize(ctx context.Context) (*pollState, error) {
+	if err := p.client.DeleteWebhook(ctx); err != nil {
+		return nil, err
+	}
+	offset, err := p.store.UpstreamOffset(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.logger.Info("Telegram polling started", "offset", offset)
+	return &pollState{offset: offset, delay: time.Second}, nil
+}
+
+func (p *Poller) step(ctx context.Context, state *pollState) error {
+	updates, err := p.client.GetUpdates(ctx, state.offset, p.timeoutSeconds, p.allowedUpdates)
+	if err != nil {
+		return p.handlePollFailure(ctx, state, err)
+	}
+	if err := p.store.Ingest(ctx, updates, p.targets); err != nil {
+		return p.handleIngestFailure(ctx, state, err)
+	}
+	state.offset = nextOffset(state.offset, updates)
+	if len(updates) > 0 {
+		p.logger.Debug("stored Telegram updates", "count", len(updates), "next_offset", state.offset)
+	}
+	state.delay = time.Second
+	return nil
+}
+
+func (p *Poller) handlePollFailure(ctx context.Context, state *pollState, err error) error {
+	if fatalTelegramError(err) {
+		return err
+	}
+	p.logger.Warn("Telegram polling failed; retrying", "error", err, "delay", state.delay)
+	if !sleepContext(ctx, retryDelay(err, state.delay, p.maxRetry)) {
+		return ctx.Err()
+	}
+	state.delay = min(state.delay*2, p.maxRetry)
+	return nil
+}
+
+func (p *Poller) handleIngestFailure(ctx context.Context, state *pollState, err error) error {
+	if !errors.Is(err, store.ErrBacklogFull) {
+		return err
+	}
+	p.logger.Warn("downstream backlog is full; upstream polling paused", "error", err, "delay", state.delay)
+	if !sleepContext(ctx, state.delay) {
+		return ctx.Err()
+	}
+	state.delay = min(state.delay*2, p.maxRetry)
+	return nil
+}
+
+func nextOffset(current int64, updates []routing.Update) int64 {
+	for _, update := range updates {
+		current = max(current, update.ID+1)
+	}
+	return current
 }
 
 func fatalTelegramError(err error) bool {

@@ -123,9 +123,74 @@ func TestClientForwardsBotAndFileRequests(t *testing.T) {
 	if string(fileBody) != "file-data" {
 		t.Fatalf("file response = %q", fileBody)
 	}
-	if _, err := client.ForwardFile(context.Background(), http.MethodGet, "", "", nil); err == nil {
-		t.Fatal("empty file path was accepted")
+	for _, invalid := range []string{"", "../secret", "dir/./file", "dir//file"} {
+		if _, err := client.ForwardFile(context.Background(), http.MethodGet, invalid, "", nil); err == nil {
+			t.Fatalf("invalid file path %q was accepted", invalid)
+		}
 	}
+}
+
+func TestGetMeAndResponseShapeFailures(t *testing.T) {
+	tests := []struct {
+		body string
+		want string
+	}{
+		{`{"ok":true,"result":{"id":0}}`, "invalid bot identity"},
+		{`{"ok":true}`, "missing result"},
+		{`{"ok":true,"result":"wrong"}`, "invalid shape"},
+		{`{"ok":false}`, "HTTP 200"},
+	}
+	for _, test := range tests {
+		server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+			io.WriteString(response, test.body)
+		}))
+		client := New(testTelegramToken, server.URL, server.URL, server.Client())
+		err := client.GetMe(context.Background())
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("GetMe error = %v, want %q", err, test.want)
+		}
+	}
+	if got := (&APIError{StatusCode: 500}).Error(); got != "Telegram API returned HTTP 500" {
+		t.Fatalf("APIError = %q", got)
+	}
+}
+
+func TestProxyRejectsRedirectsAndStripsHopHeaders(t *testing.T) {
+	var upstreamHeader http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		upstreamHeader = request.Header.Clone()
+		if request.URL.Path == "/redirect" {
+			http.Redirect(response, request, serverURL(request)+"/final", http.StatusFound)
+			return
+		}
+		io.WriteString(response, `{}`)
+	}))
+	defer server.Close()
+	client := New(testTelegramToken, server.URL, server.URL, nil)
+	response, err := client.ForwardBot(context.Background(), http.MethodPost, "sendMessage", "", http.Header{"Connection": {"close"}, "X-Test": {"yes"}}, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if upstreamHeader.Get("Connection") != "" || upstreamHeader.Get("X-Test") != "yes" {
+		t.Fatalf("forwarded headers = %v", upstreamHeader)
+	}
+	if got := client.redact(nil); got != nil {
+		t.Fatalf("redact(nil) = %v", got)
+	}
+	redirect := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		http.Redirect(response, request, serverURL(request)+"/final", http.StatusFound)
+	}))
+	defer redirect.Close()
+	redirectClient := New(testTelegramToken, redirect.URL, redirect.URL, nil)
+	if _, err := redirectClient.ForwardBot(context.Background(), http.MethodPost, "sendMessage", "", nil, nil, 0); err == nil || !strings.Contains(err.Error(), "redirect rejected") {
+		t.Fatalf("redirect error = %v", err)
+	}
+}
+
+func serverURL(request *http.Request) string {
+	return "http://" + request.Host
 }
 
 func TestRedactsNetworkErrors(t *testing.T) {

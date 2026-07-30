@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/osolmaz/telegram-bot-mux/internal/httpx"
 	"github.com/osolmaz/telegram-bot-mux/internal/routing"
 )
 
@@ -47,7 +48,7 @@ func New(token, apiBase, fileBase string, client *http.Client) *Client {
 		client = &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return errors.New("Telegram API redirect rejected")
+				return errors.New("telegram API redirect rejected")
 			},
 		}
 	}
@@ -67,7 +68,7 @@ func (c *Client) GetMe(ctx context.Context) error {
 		return err
 	}
 	if result.ID <= 0 {
-		return errors.New("Telegram getMe returned an invalid bot identity")
+		return errors.New("telegram getMe returned an invalid bot identity")
 	}
 	return nil
 }
@@ -89,7 +90,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 	for _, item := range raw {
 		update, err := routing.ParseUpdate(item)
 		if err != nil {
-			return nil, fmt.Errorf("Telegram returned an invalid update: %w", err)
+			return nil, fmt.Errorf("telegram returned an invalid update: %w", err)
 		}
 		updates = append(updates, update)
 	}
@@ -110,48 +111,74 @@ func (c *Client) call(ctx context.Context, method string, payload any, result an
 	request.Header.Set("Content-Type", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("Telegram request failed: %w", c.redact(err))
+		return fmt.Errorf("telegram request failed: %w", c.redact(err))
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	return decodeResponse(response, result)
 }
 
+type responseEnvelope struct {
+	OK         bool            `json:"ok"`
+	Result     json.RawMessage `json:"result"`
+	ErrorCode  int             `json:"error_code"`
+	Parameters json.RawMessage `json:"parameters"`
+}
+
 func decodeResponse(response *http.Response, result any) error {
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxTelegramResponseBytes+1))
+	body, err := readResponseBody(response.Body)
 	if err != nil {
-		return fmt.Errorf("read Telegram response: %w", err)
+		return err
 	}
-	if len(body) > maxTelegramResponseBytes {
-		return errors.New("Telegram response exceeds size limit")
-	}
-	var envelope struct {
-		OK         bool            `json:"ok"`
-		Result     json.RawMessage `json:"result"`
-		ErrorCode  int             `json:"error_code"`
-		Parameters json.RawMessage `json:"parameters"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(&envelope); err != nil {
-		return errors.New("Telegram returned invalid JSON")
+	envelope, err := decodeEnvelope(body)
+	if err != nil {
+		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.OK {
-		apiErr := &APIError{StatusCode: response.StatusCode, ErrorCode: envelope.ErrorCode}
-		var parameters struct {
-			RetryAfter int `json:"retry_after"`
-		}
-		if len(envelope.Parameters) > 0 && json.Unmarshal(envelope.Parameters, &parameters) == nil {
-			apiErr.RetryAfter = parameters.RetryAfter
-		}
-		return apiErr
+		return responseAPIError(response.StatusCode, envelope)
 	}
+	return decodeResult(envelope.Result, result)
+}
+
+func readResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxTelegramResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Telegram response: %w", err)
+	}
+	if len(data) > maxTelegramResponseBytes {
+		return nil, errors.New("telegram response exceeds size limit")
+	}
+	return data, nil
+}
+
+func decodeEnvelope(body []byte) (responseEnvelope, error) {
+	var envelope responseEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&envelope); err != nil {
+		return responseEnvelope{}, errors.New("telegram returned invalid JSON")
+	}
+	return envelope, nil
+}
+
+func responseAPIError(statusCode int, envelope responseEnvelope) error {
+	apiErr := &APIError{StatusCode: statusCode, ErrorCode: envelope.ErrorCode}
+	var parameters struct {
+		RetryAfter int `json:"retry_after"`
+	}
+	if len(envelope.Parameters) > 0 && json.Unmarshal(envelope.Parameters, &parameters) == nil {
+		apiErr.RetryAfter = parameters.RetryAfter
+	}
+	return apiErr
+}
+
+func decodeResult(raw json.RawMessage, result any) error {
 	if result == nil {
 		return nil
 	}
-	if len(envelope.Result) == 0 {
-		return errors.New("Telegram response is missing result")
+	if len(raw) == 0 {
+		return errors.New("telegram response is missing result")
 	}
-	if err := json.Unmarshal(envelope.Result, result); err != nil {
-		return errors.New("Telegram result has an invalid shape")
+	if err := json.Unmarshal(raw, result); err != nil {
+		return errors.New("telegram result has an invalid shape")
 	}
 	return nil
 }
@@ -161,8 +188,13 @@ func (c *Client) ForwardBot(ctx context.Context, requestMethod, apiMethod, rawQu
 }
 
 func (c *Client) ForwardFile(ctx context.Context, requestMethod, filePath, rawQuery string, headers http.Header) (*http.Response, error) {
+	for _, segment := range strings.Split(filePath, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return nil, errors.New("invalid Telegram file path")
+		}
+	}
 	cleaned := path.Clean("/" + filePath)
-	if cleaned == "/" || strings.Contains(filePath, "\x00") || strings.HasPrefix(cleaned, "/../") {
+	if cleaned == "/" || strings.Contains(filePath, "\x00") {
 		return nil, errors.New("invalid Telegram file path")
 	}
 	endpoint := c.fileBase + "/file/bot" + url.PathEscape(c.token) + cleaned
@@ -177,33 +209,13 @@ func (c *Client) forward(ctx context.Context, requestMethod, endpoint, rawQuery 
 	if err != nil {
 		return nil, errors.New("build Telegram proxy request failed")
 	}
-	request.Header = cloneEndToEndHeaders(headers)
+	request.Header = httpx.CloneEndToEndHeaders(headers)
 	request.ContentLength = contentLength
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("Telegram proxy request failed: %w", c.redact(err))
+		return nil, fmt.Errorf("telegram proxy request failed: %w", c.redact(err))
 	}
 	return response, nil
-}
-
-func cloneEndToEndHeaders(source http.Header) http.Header {
-	target := make(http.Header, len(source))
-	for key, values := range source {
-		if isHopByHop(key) || strings.EqualFold(key, "Host") {
-			continue
-		}
-		target[key] = append([]string(nil), values...)
-	}
-	return target
-}
-
-func isHopByHop(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
-	}
 }
 
 func (c *Client) botURL(method string) string {

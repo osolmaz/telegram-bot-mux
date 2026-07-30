@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/osolmaz/telegram-bot-mux/internal/httpx"
 	"github.com/osolmaz/telegram-bot-mux/internal/store"
 	"github.com/osolmaz/telegram-bot-mux/internal/telegram"
 )
@@ -120,40 +121,56 @@ func (s *Server) handleGetUpdates(response http.ResponseWriter, request *http.Re
 		writeTelegramError(response, http.StatusBadRequest, err.Error())
 		return
 	}
+	params, err = normalizeGetUpdatesRequest(params)
+	if err != nil {
+		writeTelegramError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	updates, err := s.waitForUpdates(request.Context(), clientID, params)
+	if err != nil {
+		if request.Context().Err() == nil {
+			s.logger.Error("getUpdates failed", "client", clientID, "error", err)
+			writeTelegramError(response, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	writeUpdates(response, updates)
+}
+
+func normalizeGetUpdatesRequest(params getUpdatesRequest) (getUpdatesRequest, error) {
 	if params.Limit < 1 || params.Limit > 100 {
 		params.Limit = 100
 	}
 	if params.Timeout < 0 || params.Timeout > 50 {
-		writeTelegramError(response, http.StatusBadRequest, "timeout must be between 0 and 50")
-		return
+		return getUpdatesRequest{}, errors.New("timeout must be between 0 and 50")
 	}
+	return params, nil
+}
+
+func (s *Server) waitForUpdates(ctx context.Context, clientID string, params getUpdatesRequest) ([]store.Delivery, error) {
 	deadline := time.NewTimer(time.Duration(params.Timeout) * time.Second)
 	defer deadline.Stop()
 	for {
 		changes := s.store.Changes()
-		updates, queryErr := s.store.GetUpdates(request.Context(), clientID, params.Offset, params.Limit)
-		if queryErr != nil {
-			s.logger.Error("getUpdates failed", "client", clientID, "error", queryErr)
-			writeTelegramError(response, http.StatusInternalServerError, "internal error")
-			return
+		updates, err := s.store.GetUpdates(ctx, clientID, params.Offset, params.Limit)
+		if err != nil {
+			return nil, err
 		}
-		if len(updates) > 0 {
-			writeUpdates(response, updates)
-			return
-		}
-		if params.Timeout == 0 {
-			writeUpdates(response, nil)
-			return
+		if updatesReady(updates, params.Timeout) {
+			return updates, nil
 		}
 		select {
-		case <-request.Context().Done():
-			return
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-deadline.C:
-			writeUpdates(response, nil)
-			return
+			return nil, nil
 		case <-changes:
 		}
 	}
+}
+
+func updatesReady(updates []store.Delivery, timeout int) bool {
+	return len(updates) > 0 || timeout == 0
 }
 
 func parseGetUpdatesRequest(response http.ResponseWriter, request *http.Request) (getUpdatesRequest, error) {
@@ -226,8 +243,8 @@ func (s *Server) proxyBot(response http.ResponseWriter, request *http.Request, c
 		writeTelegramError(response, http.StatusBadGateway, "Telegram API unavailable")
 		return
 	}
-	defer upstream.Body.Close()
-	copyHeaders(response.Header(), upstream.Header)
+	defer func() { _ = upstream.Body.Close() }()
+	httpx.CopyEndToEndHeaders(response.Header(), upstream.Header)
 	response.WriteHeader(upstream.StatusCode)
 	if _, err := io.Copy(response, upstream.Body); err != nil {
 		s.logger.Warn("Telegram Bot API response stream failed", "client", clientID, "method", method, "error", err)
@@ -245,8 +262,8 @@ func (s *Server) handleFile(response http.ResponseWriter, request *http.Request,
 		writeTelegramError(response, http.StatusBadGateway, "Telegram file API unavailable")
 		return
 	}
-	defer upstream.Body.Close()
-	copyHeaders(response.Header(), upstream.Header)
+	defer func() { _ = upstream.Body.Close() }()
+	httpx.CopyEndToEndHeaders(response.Header(), upstream.Header)
 	response.WriteHeader(upstream.StatusCode)
 	if request.Method == http.MethodHead {
 		return
@@ -256,30 +273,12 @@ func (s *Server) handleFile(response http.ResponseWriter, request *http.Request,
 	}
 }
 
-func copyHeaders(target, source http.Header) {
-	for key, values := range source {
-		if isHopByHop(key) {
-			continue
-		}
-		target[key] = append([]string(nil), values...)
-	}
-}
-
-func isHopByHop(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
-	}
-}
-
 func writeJSON(response http.ResponseWriter, status int, body string) {
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	response.WriteHeader(status)
-	_, _ = io.WriteString(response, body)
+	_, _ = io.WriteString(response, body) // #nosec G705 -- JSON content type and nosniff are set above.
 }
 
 func writeTelegramError(response http.ResponseWriter, status int, description string) {

@@ -1,5 +1,6 @@
 /bin/
 /coverage.out
+/target/
 /telegram-bot-mux
 *.db
 *.db-shm

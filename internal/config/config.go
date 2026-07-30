@@ -119,82 +119,117 @@ func applyDefaults(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = DefaultListen
 	}
-	if cfg.Telegram.APIBase == "" {
-		cfg.Telegram.APIBase = DefaultAPIBase
-	}
-	if cfg.Telegram.FileBase == "" {
-		cfg.Telegram.FileBase = cfg.Telegram.APIBase
-	}
-	cfg.Telegram.APIBase = strings.TrimRight(cfg.Telegram.APIBase, "/")
-	cfg.Telegram.FileBase = strings.TrimRight(cfg.Telegram.FileBase, "/")
-	if cfg.Telegram.PollTimeoutSeconds == 0 {
-		cfg.Telegram.PollTimeoutSeconds = DefaultPollTimeout
-	}
-	if cfg.Telegram.MaxRetrySeconds == 0 {
-		cfg.Telegram.MaxRetrySeconds = DefaultMaxRetry
-	}
-	if cfg.Retention.MaxPendingPerClient == 0 {
-		cfg.Retention.MaxPendingPerClient = DefaultMaxPending
-	}
-	if cfg.Retention.AcknowledgedSafetyWindow == 0 {
-		cfg.Retention.AcknowledgedSafetyWindow = DefaultSafetyWindow
-	}
+	applyTelegramDefaults(&cfg.Telegram)
+	applyRetentionDefaults(&cfg.Retention)
 	if cfg.Routing.Mode == "" {
 		cfg.Routing.Mode = "broadcast"
 	}
 }
 
+func applyTelegramDefaults(cfg *TelegramConfig) {
+	if cfg.APIBase == "" {
+		cfg.APIBase = DefaultAPIBase
+	}
+	if cfg.FileBase == "" {
+		cfg.FileBase = cfg.APIBase
+	}
+	cfg.APIBase = strings.TrimRight(cfg.APIBase, "/")
+	cfg.FileBase = strings.TrimRight(cfg.FileBase, "/")
+	if cfg.PollTimeoutSeconds == 0 {
+		cfg.PollTimeoutSeconds = DefaultPollTimeout
+	}
+	if cfg.MaxRetrySeconds == 0 {
+		cfg.MaxRetrySeconds = DefaultMaxRetry
+	}
+}
+
+func applyRetentionDefaults(cfg *RetentionConfig) {
+	if cfg.MaxPendingPerClient == 0 {
+		cfg.MaxPendingPerClient = DefaultMaxPending
+	}
+	if cfg.AcknowledgedSafetyWindow == 0 {
+		cfg.AcknowledgedSafetyWindow = DefaultSafetyWindow
+	}
+}
+
 func Validate(cfg Config) error {
+	if err := validateCore(cfg); err != nil {
+		return err
+	}
+	if err := validateTelegram(cfg.Telegram); err != nil {
+		return err
+	}
+	clientIDs, err := validateClients(cfg.Clients)
+	if err != nil {
+		return err
+	}
+	if err := validateRouting(cfg.Routing, clientIDs); err != nil {
+		return err
+	}
+	return validateRetention(cfg.Retention)
+}
+
+func validateCore(cfg Config) error {
 	if cfg.Version != CurrentVersion {
 		return fmt.Errorf("version must be %d", CurrentVersion)
 	}
 	if !filepath.IsAbs(cfg.Database) {
 		return errors.New("database must be an absolute path")
 	}
-	if !filepath.IsAbs(cfg.Telegram.TokenFile) {
+	return validateListen(cfg.Listen, cfg.AllowRemote)
+}
+
+func validateTelegram(cfg TelegramConfig) error {
+	if !filepath.IsAbs(cfg.TokenFile) {
 		return errors.New("telegram.token_file must be an absolute path")
 	}
-	if err := validateListen(cfg.Listen, cfg.AllowRemote); err != nil {
+	if err := validateUpstream("telegram.api_base", cfg.APIBase, cfg.AllowInsecureUpstream); err != nil {
 		return err
 	}
-	if err := validateUpstream("telegram.api_base", cfg.Telegram.APIBase, cfg.Telegram.AllowInsecureUpstream); err != nil {
+	if err := validateUpstream("telegram.file_base", cfg.FileBase, cfg.AllowInsecureUpstream); err != nil {
 		return err
 	}
-	if err := validateUpstream("telegram.file_base", cfg.Telegram.FileBase, cfg.Telegram.AllowInsecureUpstream); err != nil {
+	if err := validateTelegramTiming(cfg); err != nil {
 		return err
 	}
-	if cfg.Telegram.PollTimeoutSeconds < 1 || cfg.Telegram.PollTimeoutSeconds > 50 {
+	return validateStringSet("telegram.allowed_updates", cfg.AllowedUpdates)
+}
+
+func validateTelegramTiming(cfg TelegramConfig) error {
+	if cfg.PollTimeoutSeconds < 1 || cfg.PollTimeoutSeconds > 50 {
 		return errors.New("telegram.poll_timeout_seconds must be between 1 and 50")
 	}
-	if cfg.Telegram.MaxRetrySeconds < 1 || cfg.Telegram.MaxRetrySeconds > 600 {
+	if cfg.MaxRetrySeconds < 1 || cfg.MaxRetrySeconds > 600 {
 		return errors.New("telegram.max_retry_seconds must be between 1 and 600")
 	}
-	if err := validateStringSet("telegram.allowed_updates", cfg.Telegram.AllowedUpdates); err != nil {
-		return err
+	return nil
+}
+
+func validateClients(clients []ClientConfig) (map[string]struct{}, error) {
+	if len(clients) == 0 {
+		return nil, errors.New("at least one client is required")
 	}
-	if len(cfg.Clients) == 0 {
-		return errors.New("at least one client is required")
-	}
-	clientIDs := make(map[string]struct{}, len(cfg.Clients))
-	for _, client := range cfg.Clients {
+	clientIDs := make(map[string]struct{}, len(clients))
+	for _, client := range clients {
 		if !clientIDPattern.MatchString(client.ID) {
-			return fmt.Errorf("client id %q must match %s", client.ID, clientIDPattern)
+			return nil, fmt.Errorf("client id %q must match %s", client.ID, clientIDPattern)
 		}
 		if _, exists := clientIDs[client.ID]; exists {
-			return fmt.Errorf("duplicate client id %q", client.ID)
+			return nil, fmt.Errorf("duplicate client id %q", client.ID)
 		}
 		if !filepath.IsAbs(client.TokenFile) {
-			return fmt.Errorf("client %q token_file must be absolute", client.ID)
+			return nil, fmt.Errorf("client %q token_file must be absolute", client.ID)
 		}
 		clientIDs[client.ID] = struct{}{}
 	}
-	if err := validateRouting(cfg.Routing, clientIDs); err != nil {
-		return err
-	}
-	if cfg.Retention.MaxPendingPerClient < 1 {
+	return clientIDs, nil
+}
+
+func validateRetention(cfg RetentionConfig) error {
+	if cfg.MaxPendingPerClient < 1 {
 		return errors.New("retention.max_pending_per_client must be positive")
 	}
-	if cfg.Retention.AcknowledgedSafetyWindow < 0 {
+	if cfg.AcknowledgedSafetyWindow < 0 {
 		return errors.New("retention.acknowledged_safety_window must not be negative")
 	}
 	return nil
@@ -223,18 +258,28 @@ func validateUpstream(field, value string, allowInsecure bool) error {
 	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("%s must be an absolute HTTP URL without query or fragment", field)
 	}
+	return validateUpstreamScheme(field, parsed, allowInsecure)
+}
+
+func validateUpstreamScheme(field string, parsed *url.URL, allowInsecure bool) error {
 	if parsed.Scheme == "https" {
 		return nil
 	}
 	if parsed.Scheme != "http" {
 		return fmt.Errorf("%s must use HTTP or HTTPS", field)
 	}
-	host := parsed.Hostname()
-	ip := net.ParseIP(host)
-	if !allowInsecure && !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return fmt.Errorf("%s may use HTTP only for loopback unless allow_insecure_upstream is true", field)
+	if allowInsecure || loopbackHost(parsed.Hostname()) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%s may use HTTP only for loopback unless allow_insecure_upstream is true", field)
+}
+
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateStringSet(field string, values []string) error {
@@ -252,38 +297,45 @@ func validateStringSet(field string, values []string) error {
 }
 
 func validateRouting(routing RoutingConfig, clientIDs map[string]struct{}) error {
-	switch routing.Mode {
-	case "broadcast":
+	if routing.Mode == "broadcast" {
 		if len(routing.Rules) != 0 || len(routing.FallbackClients) != 0 {
 			return errors.New("broadcast routing must not define rules or fallback_clients")
 		}
 		return nil
-	case "exclusive":
-		if len(routing.Rules) == 0 || len(routing.FallbackClients) == 0 {
-			return errors.New("exclusive routing requires rules and fallback_clients")
-		}
-	default:
+	}
+	if routing.Mode != "exclusive" {
 		return errors.New("routing.mode must be broadcast or exclusive")
+	}
+	return validateExclusiveRouting(routing, clientIDs)
+}
+
+func validateExclusiveRouting(routing RoutingConfig, clientIDs map[string]struct{}) error {
+	if len(routing.Rules) == 0 || len(routing.FallbackClients) == 0 {
+		return errors.New("exclusive routing requires rules and fallback_clients")
 	}
 	if err := validateClientReferences("routing.fallback_clients", routing.FallbackClients, clientIDs); err != nil {
 		return err
 	}
 	for index, rule := range routing.Rules {
-		label := fmt.Sprintf("routing.rules[%d]", index)
-		if err := validateClientReferences(label+".clients", rule.Clients, clientIDs); err != nil {
-			return err
-		}
-		if len(rule.UpdateTypes) == 0 && len(rule.CallbackDataPrefixes) == 0 {
-			return fmt.Errorf("%s must define update_types or callback_data_prefixes", label)
-		}
-		if err := validateStringSet(label+".update_types", rule.UpdateTypes); err != nil {
-			return err
-		}
-		if err := validateStringSet(label+".callback_data_prefixes", rule.CallbackDataPrefixes); err != nil {
+		if err := validateRoutingRule(index, rule, clientIDs); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func validateRoutingRule(index int, rule RoutingRule, clientIDs map[string]struct{}) error {
+	label := fmt.Sprintf("routing.rules[%d]", index)
+	if err := validateClientReferences(label+".clients", rule.Clients, clientIDs); err != nil {
+		return err
+	}
+	if len(rule.UpdateTypes) == 0 && len(rule.CallbackDataPrefixes) == 0 {
+		return fmt.Errorf("%s must define update_types or callback_data_prefixes", label)
+	}
+	if err := validateStringSet(label+".update_types", rule.UpdateTypes); err != nil {
+		return err
+	}
+	return validateStringSet(label+".callback_data_prefixes", rule.CallbackDataPrefixes)
 }
 
 func validateClientReferences(field string, values []string, clientIDs map[string]struct{}) error {
@@ -352,7 +404,7 @@ func readBounded(path string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err

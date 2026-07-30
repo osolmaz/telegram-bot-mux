@@ -123,6 +123,74 @@ func TestLoadCredentialsRejectsDuplicatesAndWeakTokens(t *testing.T) {
 	}
 }
 
+func TestValidateBoundaryCases(t *testing.T) {
+	base := Config{
+		Version: CurrentVersion, Listen: DefaultListen, Database: "/tmp/state.db",
+		Telegram: TelegramConfig{TokenFile: "/tmp/telegram", APIBase: DefaultAPIBase, FileBase: DefaultAPIBase, PollTimeoutSeconds: 30, MaxRetrySeconds: 30},
+		Clients:  []ClientConfig{{ID: "client", TokenFile: "/tmp/client"}},
+		Routing:  RoutingConfig{Mode: "broadcast"}, Retention: RetentionConfig{MaxPendingPerClient: 1},
+	}
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"bad listen", func(c *Config) { c.Listen = "bad" }, "host:port"},
+		{"remote allowed", func(c *Config) { c.Listen = "0.0.0.0:80"; c.AllowRemote = true }, ""},
+		{"invalid api", func(c *Config) { c.Telegram.APIBase = "://" }, "absolute HTTP URL"},
+		{"api query", func(c *Config) { c.Telegram.APIBase = "https://example.com?a=1" }, "without query"},
+		{"bad scheme", func(c *Config) { c.Telegram.APIBase = "ftp://example.com" }, "HTTP or HTTPS"},
+		{"remote http", func(c *Config) { c.Telegram.APIBase = "http://example.com" }, "only for loopback"},
+		{"remote http allowed", func(c *Config) { c.Telegram.APIBase = "http://example.com"; c.Telegram.AllowInsecureUpstream = true }, ""},
+		{"poll timeout", func(c *Config) { c.Telegram.PollTimeoutSeconds = 51 }, "poll_timeout_seconds"},
+		{"retry timeout", func(c *Config) { c.Telegram.MaxRetrySeconds = 0 }, "max_retry_seconds"},
+		{"duplicate updates", func(c *Config) { c.Telegram.AllowedUpdates = []string{"message", "message"} }, "duplicate"},
+		{"no clients", func(c *Config) { c.Clients = nil }, "at least one client"},
+		{"relative client token", func(c *Config) { c.Clients[0].TokenFile = "token" }, "must be absolute"},
+		{"unknown routing mode", func(c *Config) { c.Routing.Mode = "magic" }, "broadcast or exclusive"},
+		{"broadcast fields", func(c *Config) { c.Routing.Rules = []RoutingRule{{}} }, "must not define"},
+		{"bad retention", func(c *Config) { c.Retention.MaxPendingPerClient = -1 }, "must be positive"},
+		{"bad safety window", func(c *Config) { c.Retention.AcknowledgedSafetyWindow = -1 }, "must not be negative"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			cfg.Clients = append([]ClientConfig(nil), base.Clients...)
+			test.edit(&cfg)
+			err := Validate(cfg)
+			if test.want == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.want != "" && (err == nil || !strings.Contains(err.Error(), test.want)) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestSecretFileShapeErrors(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Telegram: TelegramConfig{TokenFile: filepath.Join(dir, "telegram")}, Clients: []ClientConfig{{ID: "client", TokenFile: filepath.Join(dir, "client")}}}
+	writeTestFile(t, cfg.Telegram.TokenFile, "telegram", 0o600)
+	if err := os.Mkdir(cfg.Clients[0].TokenFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCredentials(cfg); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("directory secret error = %v", err)
+	}
+	if err := os.Remove(cfg.Clients[0].TokenFile); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, cfg.Clients[0].TokenFile, "123456:first\nsecond", 0o600)
+	if _, err := LoadCredentials(cfg); err == nil || !strings.Contains(err.Error(), "one nonempty line") {
+		t.Fatalf("multiline error = %v", err)
+	}
+	writeTestFile(t, cfg.Clients[0].TokenFile, strings.Repeat("x", maxSecretBytes+1), 0o600)
+	if _, err := LoadCredentials(cfg); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversize error = %v", err)
+	}
+}
+
 func writeTestFile(t *testing.T, path, value string, mode os.FileMode) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(value), mode); err != nil {
