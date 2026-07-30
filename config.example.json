@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:8080",
+  "database": "/var/lib/telegram-bot-mux/state.db",
+  "telegram": {
+    "token_file": "/run/secrets/telegram-token",
+    "allowed_updates": [
+      "message",
+      "edited_message",
+      "channel_post",
+      "callback_query",
+      "message_reaction"
+    ]
+  },
+  "clients": [
+    {
+      "id": "openclaw",
+      "token_file": "/run/secrets/openclaw-token"
+    },
+    {
+      "id": "unyolo",
+      "token_file": "/run/secrets/unyolo-token"
+    }
+  ],
+  "routing": {
+    "mode": "broadcast"
+  },
+  "retention": {
+    "max_pending_per_client": 10000,
+    "acknowledged_safety_window": 1000
+  }
+}

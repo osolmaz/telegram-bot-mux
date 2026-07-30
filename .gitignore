@@ -1,0 +1,10 @@
+/bin/
+/coverage.out
+/target/
+/telegram-bot-mux
+*.db
+*.db-shm
+*.db-wal
+*.tmp
+.env
+.DS_Store
